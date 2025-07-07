@@ -196,7 +196,7 @@ mod entity_actor {
         ///
         /// We have received an explicit shutdown command, so we wait for all tasks to complete and then call the shutdown function.
         async fn soft_shutdown_state(mut self) {
-            while let Some(_) = self.tasks.next().await {}
+            while (self.tasks.next().await).is_some() {}
             P::on_shutdown(self.state.clone(), ShutdownCause::Soft).await;
             self.main
                 .send(
@@ -398,8 +398,7 @@ mod main_actor {
             // Recycle the actor for later use.
             if self.pool.len() < self.pool.capacity() {
                 // self.pool.push((sender, actor));
-            } else {
-            }
+            } 
         }
 
         /// Get or create an entity actor for the given id.
@@ -520,7 +519,7 @@ mod main_actor {
                     Some(task) = self.tasks.join_next(), if !self.pool.is_empty() => {
                         // Handle completed task
                         if let Err(e) = task {
-                            eprintln!("Task failed: {:?}", e);
+                            eprintln!("Task failed: {e:?}");
                         }
                     }
                 }
@@ -552,7 +551,7 @@ mod main_actor {
             drop(internal_recv);
             while let Some(res) = tasks.join_next().await {
                 if let Err(e) = res {
-                    eprintln!("Task failed during shutdown: {:?}", e);
+                    eprintln!("Task failed during shutdown: {e:?}");
                 }
             }
         }
@@ -700,7 +699,7 @@ mod tests {
         impl entity_actor::State<Counters> {
             async fn with_value(&self, f: impl FnOnce(&mut u128)) -> Result<(), &'static str> {
                 let mut r = self.state.0.borrow_mut();
-                f(&mut *r);
+                f(&mut r);
                 Ok(())
             }
         }
@@ -799,7 +798,7 @@ mod tests {
         }
 
         fn get_path(root: impl AsRef<Path>, id: u64) -> PathBuf {
-            root.as_ref().join(hex::encode(&id.to_be_bytes()))
+            root.as_ref().join(hex::encode(id.to_be_bytes()))
         }
 
         impl entity_actor::State<Counters> {
@@ -921,7 +920,7 @@ mod tests {
         #[tokio::test]
         async fn bench_entity_manager_fs() -> testresult::TestResult<()> {
             let dir = tempfile::tempdir()?;
-            let counter_manager = CountersManager::new(dir.path().to_owned());
+            let counter_manager = CountersManager::new(dir.path());
             for i in 0..10000 {
                 counter_manager.add(i, i as u128).await?;
             }
