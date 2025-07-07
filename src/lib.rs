@@ -4,7 +4,7 @@ use n0_future::{FuturesUnordered, future};
 use tokio::sync::{mpsc, oneshot};
 
 /// Trait to reset an entity state in place.
-/// 
+///
 /// In many cases this is just assigning the default value, but e.g. for an
 /// `Arc<Mutex<T>>` resetting to the default value means an allocation, whereas
 /// reset can be done without.
@@ -26,10 +26,27 @@ pub enum ShutdownCause {
 /// Parameters for the entity manager system.
 pub trait Params: Send + Sync + 'static {
     /// Entity id type.
+    ///
+    /// This does not require Copy to allow for more complex types, such as `String`,
+    /// but you have to make sure that ids are small and cheap to clone, since they are
+    /// used as keys in maps.
     type EntityId: Debug + Hash + Eq + Clone + Send + Sync + 'static;
     /// Global state type.
+    ///
+    /// This is passed into all entity actors. It also needs to be cheap handle.
+    /// If you don't need it, just set it to `()`.
     type GlobalState: Debug + Default + Clone + Send + Sync + 'static;
     /// Entity state type.
+    ///
+    /// This is the actual distinct per-entity state. This needs to implement
+    /// `Default` and a matching `Reset`. It also needs to implement `Clone`
+    /// since we unfortunately need to pass an owned copy of the state to the
+    /// callback - otherwise we run into some rust lifetime limitations
+    /// <https://github.com/rust-lang/rust/issues/100013>.
+    ///
+    /// Frequently this is an `Arc<Mutex<T>>` or similar. Note that per entity
+    /// access is concurrent but not parallel, so you can use a more efficient
+    /// synchronization primitive like [`AtomicRefCell`](https://crates.io/crates/atomic_refcell) if you want to.
     type EntityState: Default + Reset + Clone + Send + Sync + 'static;
     /// Function being called when an entity actor is shutting down.
     fn on_shutdown(
@@ -43,17 +60,18 @@ pub trait Params: Send + Sync + 'static {
 /// Sent to the main actor and then delegated to the entity actor to spawn a new task.
 pub(crate) struct Spawn<P: Params> {
     id: P::EntityId,
-    f: Box<dyn FnOnce(CbArg<P>) -> future::Boxed<()> + Send>,
+    f: Box<dyn FnOnce(SpawnArg<P>) -> future::Boxed<()> + Send>,
 }
 
 pub(crate) struct EntityShutdown;
 
-pub enum CbArg<P: Params> {
-    /// We successfully spawned a new task inside the entity actor.
-    Ok(entity_actor::State<P>),
-    /// The entity actor is busy and cannot spawn a new task.
+/// Argument for the `EntityManager::spawn` function.
+pub enum SpawnArg<P: Params> {
+    /// The entity is active, and we were able to spawn a task.
+    Active(ActiveEntityState<P>),
+    /// The entity is busy and cannot spawn a new task.
     Busy,
-    /// The entity actor is dead.
+    /// The entity is dead.
     Dead,
 }
 
@@ -82,7 +100,7 @@ struct ShutdownAll {
 /// With this message the entity actor sends back the remaining state. The tasks set
 /// at this point must be empty, as the entity actor has already completed all tasks.
 struct ShutdownComplete<P: Params> {
-    state: entity_actor::State<P>,
+    state: ActiveEntityState<P>,
     tasks: FuturesUnordered<future::Boxed<()>>,
 }
 
@@ -90,17 +108,20 @@ mod entity_actor {
     use n0_future::{FuturesUnordered, StreamExt, future};
     use tokio::sync::mpsc;
 
+    use super::{
+        DropShutdown, EntityShutdown, Params, Shutdown, ShutdownCause, ShutdownComplete, Spawn,
+        SpawnArg,
+    };
     use crate::Reset;
 
-    use super::{
-        CbArg, DropShutdown, EntityShutdown, Params, Shutdown, ShutdownCause, ShutdownComplete,
-        Spawn,
-    };
-
+    /// State of an active entity.
     #[derive(Debug)]
     pub struct State<P: Params> {
+        /// The entity id.
         pub id: P::EntityId,
+        /// A copy of the global state.
         pub global: P::GlobalState,
+        /// The per-entity state which might have internal mutability.
         pub state: P::EntityState,
     }
 
@@ -144,7 +165,7 @@ mod entity_actor {
                         };
                         match command {
                             Command::Spawn(spawn) => {
-                                let task = (spawn.f)(CbArg::Ok(self.state.clone()));
+                                let task = (spawn.f)(SpawnArg::Active(self.state.clone()));
                                 self.tasks.push(task);
                             }
                             Command::EntityShutdown(_) => {
@@ -246,20 +267,20 @@ mod entity_actor {
         }
     }
 }
+pub use entity_actor::State as ActiveEntityState;
 
 mod main_actor {
-    use std::{collections::HashMap};
+    use std::collections::HashMap;
 
     use n0_future::FuturesUnordered;
     use tokio::{sync::mpsc, task::JoinSet};
     use tracing::{error, warn};
 
-    use crate::Reset;
-
     use super::{
-        CbArg, DropShutdown, EntityShutdown, Params, Shutdown, ShutdownAll, ShutdownComplete,
-        Spawn, entity_actor,
+        DropShutdown, EntityShutdown, Params, Shutdown, ShutdownAll, ShutdownComplete, Spawn,
+        SpawnArg, entity_actor,
     };
+    use crate::Reset;
 
     pub(super) enum Command<P: Params> {
         Spawn(Spawn<P>),
@@ -337,7 +358,9 @@ mod main_actor {
             entity_actor::Actor<P>,
         )>,
         /// Maximum size of the inbox of an entity actor.
-        queue_size: usize,
+        entity_inbox_size: usize,
+        /// Initial capacity of the futures set for entity actors.
+        entity_futures_initial_capacity: usize,
     }
 
     impl<P: Params> Actor<P> {
@@ -345,10 +368,11 @@ mod main_actor {
             state: P::GlobalState,
             recv: tokio::sync::mpsc::Receiver<Command<P>>,
             pool_capacity: usize,
-            queue_size: usize,
-            entity_response_queue_size: usize,
+            entity_inbox_size: usize,
+            entity_response_inbox_size: usize,
+            entity_futures_initial_capacity: usize,
         ) -> Self {
-            let (internal_send, internal_recv) = mpsc::channel(entity_response_queue_size);
+            let (internal_send, internal_recv) = mpsc::channel(entity_response_inbox_size);
             Self {
                 recv,
                 internal_send,
@@ -357,7 +381,8 @@ mod main_actor {
                 tasks: JoinSet::new(),
                 state,
                 pool: Vec::with_capacity(pool_capacity),
-                queue_size,
+                entity_inbox_size,
+                entity_futures_initial_capacity,
             }
         }
 
@@ -387,7 +412,7 @@ mod main_actor {
                     self.tasks.spawn(actor.run());
                     EntityHandle::Live { send: sender }
                 } else {
-                    let (sender, recv) = mpsc::channel(self.queue_size);
+                    let (sender, recv) = mpsc::channel(self.entity_inbox_size);
                     let state: entity_actor::State<P> = entity_actor::State {
                         id: id.clone(),
                         global: self.state.clone(),
@@ -397,7 +422,9 @@ mod main_actor {
                         main: self.internal_send.clone(),
                         recv,
                         state,
-                        tasks: FuturesUnordered::with_capacity(16),
+                        tasks: FuturesUnordered::with_capacity(
+                            self.entity_futures_initial_capacity,
+                        ),
                     };
                     self.tasks.spawn(actor.run());
                     EntityHandle::Live { send: sender }
@@ -424,14 +451,14 @@ mod main_actor {
                                             warn!("Entity actor inbox is full, cannot send command to entity actor {:?}.", spawn.id);
                                             // we await in the select here, but I think this is fine, since the actor is busy.
                                             // maybe slowing things down a bit is helpful.
-                                            (spawn.f)(CbArg::Busy).await;
+                                            (spawn.f)(SpawnArg::Busy).await;
                                         }
                                         mpsc::error::TrySendError::Closed(cmd) => {
                                             let entity_actor::Command::Spawn(spawn) = cmd else { panic!() };
                                             error!("Entity actor inbox is closed, cannot send command to entity actor {:?}.", spawn.id);
                                             // give the caller a chance to react to this bad news.
                                             // at this point we are in trouble anyway, so awaiting is going to be the least of our problems.
-                                            (spawn.f)(CbArg::Dead).await;
+                                            (spawn.f)(SpawnArg::Dead).await;
                                         }
                                     }
                                 }
@@ -532,31 +559,84 @@ mod main_actor {
     }
 }
 
+/// A manager for entities identified by an entity id.
+///
+/// The manager provides parallelism between entities, but just concurrency within a single entity.
+/// This is useful if the entity wraps an external resource such as a file that does not benefit
+/// from parallelism.
+///
+/// The entity manager internally uses a main actor and per-entity actors. Per entity actors
+/// and their inbox queues are recycled when they become idle, to save allocations.
+///
+/// You can mostly ignore these implementation details, except when you want to customize the
+/// queue sizes in the [`Options`] struct.
+///
+/// The main entry point is the [`EntityManager::spawn`] function.
+///
+/// Dropping the `EntityManager` will shut down the entity actors without waiting for their
+/// tasks to complete. For a more gentle shutdown, use the [`EntityManager::shutdown`] function
+/// that does wait for tasks to complete.
 pub struct EntityManager<P: Params>(mpsc::Sender<main_actor::Command<P>>);
 
+#[derive(Debug, Clone, Copy)]
+pub struct Options {
+    /// Maximum number of inactive entity actors that are being pooled for reuse.
+    pub pool_capacity: usize,
+    /// Size of the inbox for the manager actor.
+    pub inbox_size: usize,
+    /// Size of the inbox for entity actors.
+    pub entity_inbox_size: usize,
+    /// Size of the inbox for entity actor responses to the manager actor.
+    pub entity_response_inbox_size: usize,
+    /// Initial capacity of the futures set for entity actors.
+    ///
+    /// Set this to the expected average concurrency level of your entities.
+    pub entity_futures_initial_capacity: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            pool_capacity: 10,
+            inbox_size: 10,
+            entity_inbox_size: 10,
+            entity_response_inbox_size: 100,
+            entity_futures_initial_capacity: 16,
+        }
+    }
+}
+
 impl<P: Params> EntityManager<P> {
-    pub fn new(
-        state: P::GlobalState,
-        pool_capacity: usize,
-        entity_queue_size: usize,
-        queue_size: usize,
-        entity_response_queue_size: usize,
-    ) -> Self {
-        let (send, recv) = mpsc::channel(queue_size);
+    pub fn new(state: P::GlobalState, options: Options) -> Self {
+        let (send, recv) = mpsc::channel(options.inbox_size);
         let actor = main_actor::Actor::new(
             state,
             recv,
-            pool_capacity,
-            entity_queue_size,
-            entity_response_queue_size,
+            options.pool_capacity,
+            options.entity_inbox_size,
+            options.entity_response_inbox_size,
+            options.entity_futures_initial_capacity,
         );
         tokio::spawn(actor.run());
         Self(send)
     }
 
+    /// Spawn a new task on the entity actor with the given id.
+    ///
+    /// Unless the world is ending - e.g. tokio runtime is shutting down - the passed function
+    /// is guaranteed to be called. However, there is no guarantee that the entity actor is
+    /// alive and responsive. See [`SpawnArg`] for details.
+    ///
+    /// Multiple callbacks for the same entity will be executed sequentially. There is no
+    /// parallelism within a single entity. So you can use synchronization primitives that
+    /// assume unique access in P::EntityState. And even if you do use multithreaded synchronization
+    /// primitives, they will never be contended.
+    ///
+    /// The future returned by `f` will be executed concurrently with other tasks, but again
+    /// there will be no real parallelism within a single entity actor.
     pub async fn spawn<F, Fut>(&self, id: P::EntityId, f: F) -> Result<(), &'static str>
     where
-        F: FnOnce(CbArg<P>) -> Fut + Send + 'static,
+        F: FnOnce(SpawnArg<P>) -> Fut + Send + 'static,
         Fut: future::Future<Output = ()> + Send + 'static,
     {
         let spawn = Spawn {
@@ -613,7 +693,7 @@ mod tests {
             async fn on_shutdown(_state: entity_actor::State<Self>, _cause: ShutdownCause) {}
         }
 
-                struct CountersManager {
+        struct CountersManager {
             m: EntityManager<Counters>,
         }
 
@@ -627,19 +707,8 @@ mod tests {
 
         impl CountersManager {
             pub fn new() -> Self {
-                let state = ();
-                let pool_capacity = 10;
-                let entity_queue_size = 10;
-                let queue_size = 10;
-                let entity_response_queue_size = 100;
                 Self {
-                    m: EntityManager::<Counters>::new(
-                        state,
-                        pool_capacity,
-                        entity_queue_size,
-                        queue_size,
-                        entity_response_queue_size,
-                    ),
+                    m: EntityManager::<Counters>::new((), Options::default()),
                 }
             }
 
@@ -647,7 +716,7 @@ mod tests {
                 self.m
                     .spawn(id, move |arg| async move {
                         match arg {
-                            CbArg::Ok(state) => {
+                            SpawnArg::Active(state) => {
                                 // println!(
                                 //     "Adding value {} to entity actor with id {:?}",
                                 //     value, state.id
@@ -657,8 +726,8 @@ mod tests {
                                     .await
                                     .unwrap();
                             }
-                            CbArg::Busy => println!("Entity actor is busy"),
-                            CbArg::Dead => println!("Entity actor is dead"),
+                            SpawnArg::Busy => println!("Entity actor is busy"),
+                            SpawnArg::Dead => println!("Entity actor is dead"),
                         }
                     })
                     .await
@@ -669,7 +738,7 @@ mod tests {
                 self.m
                     .spawn(id, move |arg| async move {
                         match arg {
-                            CbArg::Ok(state) => {
+                            SpawnArg::Active(state) => {
                                 state
                                     .with_value(|v| {
                                         tx.send(*v)
@@ -678,8 +747,8 @@ mod tests {
                                     .await
                                     .unwrap();
                             }
-                            CbArg::Busy => println!("Entity actor is busy"),
-                            CbArg::Dead => println!("Entity actor is dead"),
+                            SpawnArg::Busy => println!("Entity actor is busy"),
+                            SpawnArg::Dead => println!("Entity actor is dead"),
                         }
                     })
                     .await?;
@@ -703,12 +772,15 @@ mod tests {
     }
 
     mod persistent {
+        use std::{
+            path::{Path, PathBuf},
+            sync::Arc,
+            time::Duration,
+        };
+
         use atomic_refcell::AtomicRefCell;
 
         use super::*;
-        use std::{
-            path::{Path, PathBuf}, sync::Arc, time::Duration
-        };
 
         #[derive(Debug, Clone, Default)]
         enum State {
@@ -793,18 +865,8 @@ mod tests {
         impl CountersManager {
             pub fn new(path: impl AsRef<Path>) -> Self {
                 let state = Arc::new(path.as_ref().to_owned());
-                let pool_capacity = 10;
-                let entity_queue_size = 10;
-                let queue_size = 10;
-                let entity_response_queue_size = 100;
                 Self {
-                    m: EntityManager::<Counters>::new(
-                        state,
-                        pool_capacity,
-                        entity_queue_size,
-                        queue_size,
-                        entity_response_queue_size,
-                    ),
+                    m: EntityManager::<Counters>::new(state, Options::default()),
                 }
             }
 
@@ -812,7 +874,7 @@ mod tests {
                 self.m
                     .spawn(id, move |arg| async move {
                         match arg {
-                            CbArg::Ok(state) => {
+                            SpawnArg::Active(state) => {
                                 println!(
                                     "Adding value {} to entity actor with id {:?}",
                                     value, state.id
@@ -822,8 +884,8 @@ mod tests {
                                     .await
                                     .unwrap();
                             }
-                            CbArg::Busy => println!("Entity actor is busy"),
-                            CbArg::Dead => println!("Entity actor is dead"),
+                            SpawnArg::Busy => println!("Entity actor is busy"),
+                            SpawnArg::Dead => println!("Entity actor is dead"),
                         }
                     })
                     .await
@@ -834,7 +896,7 @@ mod tests {
                 self.m
                     .spawn(id, move |arg| async move {
                         match arg {
-                            CbArg::Ok(state) => {
+                            SpawnArg::Active(state) => {
                                 state
                                     .with_value(|v| {
                                         tx.send(*v)
@@ -843,8 +905,8 @@ mod tests {
                                     .await
                                     .unwrap();
                             }
-                            CbArg::Busy => println!("Entity actor is busy"),
-                            CbArg::Dead => println!("Entity actor is dead"),
+                            SpawnArg::Busy => println!("Entity actor is busy"),
+                            SpawnArg::Dead => println!("Entity actor is dead"),
                         }
                     })
                     .await?;
