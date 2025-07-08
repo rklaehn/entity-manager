@@ -575,6 +575,7 @@ mod main_actor {
 /// Dropping the `EntityManager` will shut down the entity actors without waiting for their
 /// tasks to complete. For a more gentle shutdown, use the [`EntityManager::shutdown`] function
 /// that does wait for tasks to complete.
+#[derive(Debug, Clone)]
 pub struct EntityManager<P: Params>(mpsc::Sender<main_actor::Command<P>>);
 
 #[derive(Debug, Clone, Copy)]
