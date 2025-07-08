@@ -35,7 +35,7 @@ pub trait Params: Send + Sync + 'static {
     ///
     /// This is passed into all entity actors. It also needs to be cheap handle.
     /// If you don't need it, just set it to `()`.
-    type GlobalState: Debug + Default + Clone + Send + Sync + 'static;
+    type GlobalState: Debug + Clone + Send + Sync + 'static;
     /// Entity state type.
     ///
     /// This is the actual distinct per-entity state. This needs to implement
