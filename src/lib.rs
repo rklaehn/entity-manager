@@ -252,6 +252,7 @@ mod entity_actor {
     }
 }
 pub use entity_actor::State as ActiveEntityState;
+pub use main_actor::ActorState;
 
 mod main_actor {
     use std::collections::HashMap;
@@ -314,6 +315,10 @@ mod main_actor {
         }
     }
 
+    /// State machine for an entity actor manager.
+    ///
+    /// This is if you don't want a separate manager actor, but want to inline the entity
+    /// actor management into your main actor.
     pub struct ActorState<P: Params> {
         /// Channel to receive internal commands from the entity actors.
         /// This channel will never be closed since we also hold a sender to it.
