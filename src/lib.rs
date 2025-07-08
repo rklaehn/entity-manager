@@ -85,12 +85,6 @@ struct Shutdown<P: Params> {
     receiver: mpsc::Receiver<entity_actor::Command<P>>,
 }
 
-/// Sent from the entity actor to the main actor to notify that it is shutting down
-/// due to the sender being dropped.
-struct DropShutdown<P: Params> {
-    id: P::EntityId,
-}
-
 struct ShutdownAll {
     tx: oneshot::Sender<()>,
 }
@@ -109,8 +103,7 @@ mod entity_actor {
     use tokio::sync::mpsc;
 
     use super::{
-        DropShutdown, EntityShutdown, Params, Shutdown, ShutdownCause, ShutdownComplete, Spawn,
-        SpawnArg,
+        EntityShutdown, Params, Shutdown, ShutdownCause, ShutdownComplete, Spawn, SpawnArg,
     };
     use crate::Reset;
 
@@ -198,15 +191,6 @@ mod entity_actor {
         async fn soft_shutdown_state(mut self) {
             while (self.tasks.next().await).is_some() {}
             P::on_shutdown(self.state.clone(), ShutdownCause::Soft).await;
-            self.main
-                .send(
-                    DropShutdown {
-                        id: self.state.id.clone(),
-                    }
-                    .into(),
-                )
-                .await
-                .ok();
         }
 
         async fn recycle_state(self) {
@@ -272,13 +256,13 @@ pub use entity_actor::State as ActiveEntityState;
 mod main_actor {
     use std::collections::HashMap;
 
-    use n0_future::FuturesUnordered;
+    use n0_future::{future, FuturesUnordered};
     use tokio::{sync::mpsc, task::JoinSet};
     use tracing::{error, warn};
 
     use super::{
-        DropShutdown, EntityShutdown, Params, Shutdown, ShutdownAll, ShutdownComplete, Spawn,
-        SpawnArg, entity_actor,
+        EntityShutdown, Params, Shutdown, ShutdownAll, ShutdownComplete, Spawn, SpawnArg,
+        entity_actor,
     };
     use crate::Reset;
 
@@ -294,7 +278,6 @@ mod main_actor {
     }
 
     pub(super) enum InternalCommand<P: Params> {
-        DropShutdown(DropShutdown<P>),
         ShutdownComplete(ShutdownComplete<P>),
         Shutdown(Shutdown<P>),
     }
@@ -308,12 +291,6 @@ mod main_actor {
     impl<P: Params> From<ShutdownComplete<P>> for InternalCommand<P> {
         fn from(shutdown_complete: ShutdownComplete<P>) -> Self {
             Self::ShutdownComplete(shutdown_complete)
-        }
-    }
-
-    impl<P: Params> From<DropShutdown<P>> for InternalCommand<P> {
-        fn from(drop_shutdown: DropShutdown<P>) -> Self {
-            Self::DropShutdown(drop_shutdown)
         }
     }
 
@@ -363,6 +340,186 @@ mod main_actor {
         entity_futures_initial_capacity: usize,
     }
 
+    pub struct ActorState<P: Params> {
+        /// Channel to receive internal commands from the entity actors.
+        /// This channel will never be closed since we also hold a sender to it.
+        internal_recv: mpsc::Receiver<InternalCommand<P>>,
+        /// Channel to send internal commands to ourselves, to hand out to entity actors.
+        internal_send: mpsc::Sender<InternalCommand<P>>,
+        /// Map of live entity actors.
+        live: HashMap<P::EntityId, EntityHandle<P>>,
+        /// Global state shared across all entity actors.
+        state: P::GlobalState,
+        /// Pool of inactive entity actors to reuse.
+        pool: Vec<(
+            mpsc::Sender<entity_actor::Command<P>>,
+            entity_actor::Actor<P>,
+        )>,
+        /// Maximum size of the inbox of an entity actor.
+        entity_inbox_size: usize,
+        /// Initial capacity of the futures set for entity actors.
+        entity_futures_initial_capacity: usize,
+    }
+
+    impl<P: Params> ActorState<P> {
+        pub fn new(
+            state: P::GlobalState,
+            pool_capacity: usize,
+            entity_inbox_size: usize,
+            entity_response_inbox_size: usize,
+            entity_futures_initial_capacity: usize,
+        ) -> Self {
+            let (internal_send, internal_recv) = mpsc::channel(entity_response_inbox_size);
+            Self {
+                internal_recv,
+                internal_send,
+                live: HashMap::new(),
+                state,
+                pool: Vec::with_capacity(pool_capacity),
+                entity_inbox_size,
+                entity_futures_initial_capacity,
+            }
+        }
+
+        pub async fn spawn(&mut self, id: P::EntityId, f: Box<dyn FnOnce(SpawnArg<P>) -> future::Boxed<()> + Send>) -> Option<impl Future<Output = ()> + Send> {
+            let (entity_handle, task) = self.get_or_create(id.clone());
+            let sender = entity_handle.send();
+            if let Err(e) = sender.try_send(entity_actor::Command::Spawn(Spawn { id: id.clone(), f })) {
+                match e {
+                    mpsc::error::TrySendError::Full(cmd) => {
+                        let entity_actor::Command::Spawn(spawn) = cmd else { panic!() };
+                        warn!("Entity actor inbox is full, cannot send command to entity actor {:?}.", id);
+                        // we await in the select here, but I think this is fine, since the actor is busy.
+                        // maybe slowing things down a bit is helpful.
+                        (spawn.f)(SpawnArg::Busy).await;
+                    }
+                    mpsc::error::TrySendError::Closed(cmd) => {
+                        let entity_actor::Command::Spawn(spawn) = cmd else { panic!() };
+                        error!("Entity actor inbox is closed, cannot send command to entity actor {:?}.", id);
+                        // give the caller a chance to react to this bad news.
+                        // at this point we are in trouble anyway, so awaiting is going to be the least of our problems.
+                        (spawn.f)(SpawnArg::Dead).await;
+                    }
+                }
+            };
+            task
+        }
+
+        pub async fn tick(&mut self) -> Option<impl Future<Output = ()> + Send> {
+            if let Some(cmd) = self.internal_recv.recv().await {
+                match cmd {
+                    InternalCommand::Shutdown(Shutdown { id, receiver }) => {
+                        let Some(entity_handle) = self.live.remove(&id) else {
+                            error!("Received shutdown command for unknown entity actor {id:?}");
+                            return None;
+                        };
+                        let EntityHandle::Live { send } = entity_handle else {
+                            error!(
+                                "Received shutdown command for entity actor {id:?} that is already shutting down"
+                            );
+                            return None;
+                        };
+                        self.live.insert(
+                            id.clone(),
+                            EntityHandle::ShuttingDown {
+                                send,
+                                recv: receiver,
+                            },
+                        );                        
+                    }
+                    InternalCommand::ShutdownComplete(ShutdownComplete { state, tasks }) => {
+                        let id = state.id.clone();
+                        let Some(entity_handle) = self.live.remove(&id) else {
+                            error!(
+                                "Received shutdown complete command for unknown entity actor {id:?}"
+                            );
+                            return None;
+                        };
+                        let EntityHandle::ShuttingDown { send, recv } = entity_handle else {
+                            error!(
+                                "Received shutdown complete command for entity actor {id:?} that is not shutting down"
+                            );
+                            return None;
+                        };
+                        // re-assemble the actor from the parts
+                        let mut actor = entity_actor::Actor {
+                            main: self.internal_send.clone(),
+                            recv,
+                            state,
+                            tasks,
+                        };
+                        if actor.recv.is_empty() {
+                            // No commands during shutdown, we can recycle the actor.
+                            self.recycle(send, actor);
+                        } else {
+                            actor.state.state.reset();
+                            self.live.insert(id.clone(), EntityHandle::Live { send });
+                            return Some(actor.run())
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        /// Get or create an entity actor for the given id.
+        fn get_or_create(
+            &mut self,
+            id: P::EntityId,
+        ) -> (&mut EntityHandle<P>, Option<impl Future<Output = ()> + Send>) {
+            let mut task = None;
+            let handle = self.live.entry(id.clone()).or_insert_with(|| {
+                if let Some((sender, mut actor)) = self.pool.pop() {
+                    actor.state.id = id.clone();
+                    actor.state.global = self.state.clone();
+                    actor.state.state.reset();
+                    task = Some(actor.run());
+                    EntityHandle::Live { send: sender }
+                } else {
+                    let (sender, recv) = mpsc::channel(self.entity_inbox_size);
+                    let state: entity_actor::State<P> = entity_actor::State {
+                        id: id.clone(),
+                        global: self.state.clone(),
+                        state: Default::default(),
+                    };
+                    let actor = entity_actor::Actor {
+                        main: self.internal_send.clone(),
+                        recv,
+                        state,
+                        tasks: FuturesUnordered::with_capacity(
+                            self.entity_futures_initial_capacity,
+                        ),
+                    };
+                    task = Some(actor.run());
+                    EntityHandle::Live { send: sender }
+                }
+            });
+            (handle, task)
+        }
+
+        fn recycle(
+            &mut self,
+            sender: mpsc::Sender<entity_actor::Command<P>>,
+            mut actor: entity_actor::Actor<P>,
+        ) {
+            assert!(sender.strong_count() == 1);
+            // todo: check that sender and receiver are the same channel. tokio does not have an api for this, unfortunately.
+            // reset the actor in any case, just to check the invariants.
+            actor.recycle();
+            // Recycle the actor for later use.
+            if self.pool.len() < self.pool.capacity() {
+                self.pool.push((sender, actor));
+            }
+        }
+
+        /// Send a shutdown command to all live entity actors.
+        pub async fn soft_shutdown(self) {
+            for handle in self.live.values() {
+                handle.send().send(EntityShutdown {}.into()).await.ok();
+            }
+        }
+    }
+
     impl<P: Params> Actor<P> {
         pub fn new(
             state: P::GlobalState,
@@ -386,7 +543,7 @@ mod main_actor {
             }
         }
 
-        pub fn recycle(
+        fn recycle(
             &mut self,
             sender: mpsc::Sender<entity_actor::Command<P>>,
             mut actor: entity_actor::Actor<P>,
@@ -397,8 +554,8 @@ mod main_actor {
             actor.recycle();
             // Recycle the actor for later use.
             if self.pool.len() < self.pool.capacity() {
-                // self.pool.push((sender, actor));
-            } 
+                self.pool.push((sender, actor));
+            }
         }
 
         /// Get or create an entity actor for the given id.
@@ -407,7 +564,7 @@ mod main_actor {
                 if let Some((sender, mut actor)) = self.pool.pop() {
                     actor.state.id = id.clone();
                     actor.state.global = self.state.clone();
-                    actor.state.state = P::EntityState::default();
+                    actor.state.state.reset();
                     self.tasks.spawn(actor.run());
                     EntityHandle::Live { send: sender }
                 } else {
@@ -463,7 +620,8 @@ mod main_actor {
                                 }
                             }
                             Command::ShutdownAll(arg) => {
-                                self.soft_shutdown(arg).await;
+                                self.soft_shutdown().await;
+                                arg.tx.send(()).ok();
                                 break;
                             }
                         }
@@ -510,10 +668,6 @@ mod main_actor {
                                     self.live.insert(id.clone(), EntityHandle::Live { send });
                                 }
                             }
-                            InternalCommand::DropShutdown(DropShutdown { id }) => {
-                                error!("Received drop shutdown command for entity actor {id:?} despite not being in shutdown state");
-                                break;
-                            }
                         }
                     }
                     Some(task) = self.tasks.join_next(), if !self.pool.is_empty() => {
@@ -526,12 +680,11 @@ mod main_actor {
             }
         }
 
-        async fn soft_shutdown(self, arg: ShutdownAll) {
+        async fn soft_shutdown(self) {
             for handle in self.live.values() {
                 handle.send().send(EntityShutdown {}.into()).await.ok();
             }
             self.await_tasks().await;
-            arg.tx.send(()).ok();
         }
 
         async fn hard_shutdown(self) {
