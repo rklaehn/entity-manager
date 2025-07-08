@@ -256,7 +256,7 @@ pub use entity_actor::State as ActiveEntityState;
 mod main_actor {
     use std::collections::HashMap;
 
-    use n0_future::{future, FuturesUnordered};
+    use n0_future::{FuturesUnordered, future};
     use tokio::{sync::mpsc, task::JoinSet};
     use tracing::{error, warn};
 
@@ -314,32 +314,6 @@ mod main_actor {
         }
     }
 
-    pub struct Actor<P: Params> {
-        /// Channel to receive commands from the outside world.
-        /// If this channel is closed, it means we need to shut down in a hurry.
-        recv: mpsc::Receiver<Command<P>>,
-        /// Channel to receive internal commands from the entity actors.
-        /// This channel will never be closed since we also hold a sender to it.
-        internal_recv: mpsc::Receiver<InternalCommand<P>>,
-        /// Channel to send internal commands to ourselves, to hand out to entity actors.
-        internal_send: mpsc::Sender<InternalCommand<P>>,
-        /// Map of live entity actors.
-        live: HashMap<P::EntityId, EntityHandle<P>>,
-        /// Global state shared across all entity actors.
-        state: P::GlobalState,
-        /// Tasks that are currently running.
-        tasks: JoinSet<()>,
-        /// Pool of inactive entity actors to reuse.
-        pool: Vec<(
-            mpsc::Sender<entity_actor::Command<P>>,
-            entity_actor::Actor<P>,
-        )>,
-        /// Maximum size of the inbox of an entity actor.
-        entity_inbox_size: usize,
-        /// Initial capacity of the futures set for entity actors.
-        entity_futures_initial_capacity: usize,
-    }
-
     pub struct ActorState<P: Params> {
         /// Channel to receive internal commands from the entity actors.
         /// This channel will never be closed since we also hold a sender to it.
@@ -381,21 +355,38 @@ mod main_actor {
             }
         }
 
-        pub async fn spawn(&mut self, id: P::EntityId, f: Box<dyn FnOnce(SpawnArg<P>) -> future::Boxed<()> + Send>) -> Option<impl Future<Output = ()> + Send> {
+        #[must_use = "this function may return a future that must be spawned by the caller"]
+        pub async fn spawn(
+            &mut self,
+            id: P::EntityId,
+            f: Box<dyn FnOnce(SpawnArg<P>) -> future::Boxed<()> + Send>,
+        ) -> Option<impl Future<Output = ()> + Send + 'static> {
             let (entity_handle, task) = self.get_or_create(id.clone());
             let sender = entity_handle.send();
-            if let Err(e) = sender.try_send(entity_actor::Command::Spawn(Spawn { id: id.clone(), f })) {
+            if let Err(e) =
+                sender.try_send(entity_actor::Command::Spawn(Spawn { id: id.clone(), f }))
+            {
                 match e {
                     mpsc::error::TrySendError::Full(cmd) => {
-                        let entity_actor::Command::Spawn(spawn) = cmd else { panic!() };
-                        warn!("Entity actor inbox is full, cannot send command to entity actor {:?}.", id);
+                        let entity_actor::Command::Spawn(spawn) = cmd else {
+                            panic!()
+                        };
+                        warn!(
+                            "Entity actor inbox is full, cannot send command to entity actor {:?}.",
+                            id
+                        );
                         // we await in the select here, but I think this is fine, since the actor is busy.
                         // maybe slowing things down a bit is helpful.
                         (spawn.f)(SpawnArg::Busy).await;
                     }
                     mpsc::error::TrySendError::Closed(cmd) => {
-                        let entity_actor::Command::Spawn(spawn) = cmd else { panic!() };
-                        error!("Entity actor inbox is closed, cannot send command to entity actor {:?}.", id);
+                        let entity_actor::Command::Spawn(spawn) = cmd else {
+                            panic!()
+                        };
+                        error!(
+                            "Entity actor inbox is closed, cannot send command to entity actor {:?}.",
+                            id
+                        );
                         // give the caller a chance to react to this bad news.
                         // at this point we are in trouble anyway, so awaiting is going to be the least of our problems.
                         (spawn.f)(SpawnArg::Dead).await;
@@ -405,7 +396,8 @@ mod main_actor {
             task
         }
 
-        pub async fn tick(&mut self) -> Option<impl Future<Output = ()> + Send> {
+        #[must_use = "this function may return a future that must be spawned by the caller"]
+        pub async fn tick(&mut self) -> Option<impl Future<Output = ()> + Send + 'static> {
             if let Some(cmd) = self.internal_recv.recv().await {
                 match cmd {
                     InternalCommand::Shutdown(Shutdown { id, receiver }) => {
@@ -425,7 +417,7 @@ mod main_actor {
                                 send,
                                 recv: receiver,
                             },
-                        );                        
+                        );
                     }
                     InternalCommand::ShutdownComplete(ShutdownComplete { state, tasks }) => {
                         let id = state.id.clone();
@@ -454,7 +446,7 @@ mod main_actor {
                         } else {
                             actor.state.state.reset();
                             self.live.insert(id.clone(), EntityHandle::Live { send });
-                            return Some(actor.run())
+                            return Some(actor.run());
                         }
                     }
                 }
@@ -462,11 +454,21 @@ mod main_actor {
             None
         }
 
+        /// Send a shutdown command to all live entity actors.
+        pub async fn shutdown(self) {
+            for handle in self.live.values() {
+                handle.send().send(EntityShutdown {}.into()).await.ok();
+            }
+        }
+
         /// Get or create an entity actor for the given id.
         fn get_or_create(
             &mut self,
             id: P::EntityId,
-        ) -> (&mut EntityHandle<P>, Option<impl Future<Output = ()> + Send>) {
+        ) -> (
+            &mut EntityHandle<P>,
+            Option<impl Future<Output = ()> + Send + 'static>,
+        ) {
             let mut task = None;
             let handle = self.live.entry(id.clone()).or_insert_with(|| {
                 if let Some((sender, mut actor)) = self.pool.pop() {
@@ -511,13 +513,16 @@ mod main_actor {
                 self.pool.push((sender, actor));
             }
         }
+    }
 
-        /// Send a shutdown command to all live entity actors.
-        pub async fn soft_shutdown(self) {
-            for handle in self.live.values() {
-                handle.send().send(EntityShutdown {}.into()).await.ok();
-            }
-        }
+    pub struct Actor<P: Params> {
+        /// Channel to receive commands from the outside world.
+        /// If this channel is closed, it means we need to shut down in a hurry.
+        recv: mpsc::Receiver<Command<P>>,
+        /// Tasks that are currently running.
+        tasks: JoinSet<()>,
+        /// Internal state of the actor
+        state: ActorState<P>,
     }
 
     impl<P: Params> Actor<P> {
@@ -529,94 +534,42 @@ mod main_actor {
             entity_response_inbox_size: usize,
             entity_futures_initial_capacity: usize,
         ) -> Self {
-            let (internal_send, internal_recv) = mpsc::channel(entity_response_inbox_size);
             Self {
                 recv,
-                internal_send,
-                internal_recv,
-                live: HashMap::new(),
                 tasks: JoinSet::new(),
-                state,
-                pool: Vec::with_capacity(pool_capacity),
-                entity_inbox_size,
-                entity_futures_initial_capacity,
+                state: ActorState::new(
+                    state,
+                    pool_capacity,
+                    entity_inbox_size,
+                    entity_response_inbox_size,
+                    entity_futures_initial_capacity,
+                ),
             }
-        }
-
-        fn recycle(
-            &mut self,
-            sender: mpsc::Sender<entity_actor::Command<P>>,
-            mut actor: entity_actor::Actor<P>,
-        ) {
-            assert!(sender.strong_count() == 1);
-            // todo: check that sender and receiver are the same channel. tokio does not have an api for this, unfortunately.
-            // reset the actor in any case, just to check the invariants.
-            actor.recycle();
-            // Recycle the actor for later use.
-            if self.pool.len() < self.pool.capacity() {
-                self.pool.push((sender, actor));
-            }
-        }
-
-        /// Get or create an entity actor for the given id.
-        fn get_or_create(&mut self, id: P::EntityId) -> &mut EntityHandle<P> {
-            self.live.entry(id.clone()).or_insert_with(|| {
-                if let Some((sender, mut actor)) = self.pool.pop() {
-                    actor.state.id = id.clone();
-                    actor.state.global = self.state.clone();
-                    actor.state.state.reset();
-                    self.tasks.spawn(actor.run());
-                    EntityHandle::Live { send: sender }
-                } else {
-                    let (sender, recv) = mpsc::channel(self.entity_inbox_size);
-                    let state: entity_actor::State<P> = entity_actor::State {
-                        id: id.clone(),
-                        global: self.state.clone(),
-                        state: Default::default(),
-                    };
-                    let actor = entity_actor::Actor {
-                        main: self.internal_send.clone(),
-                        recv,
-                        state,
-                        tasks: FuturesUnordered::with_capacity(
-                            self.entity_futures_initial_capacity,
-                        ),
-                    };
-                    self.tasks.spawn(actor.run());
-                    EntityHandle::Live { send: sender }
-                }
-            })
         }
 
         pub async fn run(mut self) {
+            enum SelectOutcome<A, B, C> {
+                Command(A),
+                Tick(B),
+                TaskDone(C),
+            }
             loop {
-                tokio::select! {
-                    cmd = self.recv.recv() => {
+                let res = tokio::select! {
+                    x = self.recv.recv() => SelectOutcome::Command(x),
+                    x = self.state.tick() => SelectOutcome::Tick(x),
+                    Some(task) = self.tasks.join_next(), if !self.tasks.is_empty() => SelectOutcome::TaskDone(task),
+                };
+                match res {
+                    SelectOutcome::Command(cmd) => {
                         let Some(cmd) = cmd else {
+                            // Channel closed, this means that the main actor is shutting down.
                             self.hard_shutdown().await;
                             break;
                         };
                         match cmd {
                             Command::Spawn(spawn) => {
-                                let entity_handle = self.get_or_create(spawn.id.clone());
-                                let sender = entity_handle.send();
-                                if let Err(e) = sender.try_send(entity_actor::Command::Spawn(spawn)) {
-                                    match e {
-                                        mpsc::error::TrySendError::Full(cmd) => {
-                                            let entity_actor::Command::Spawn(spawn) = cmd else { panic!() };
-                                            warn!("Entity actor inbox is full, cannot send command to entity actor {:?}.", spawn.id);
-                                            // we await in the select here, but I think this is fine, since the actor is busy.
-                                            // maybe slowing things down a bit is helpful.
-                                            (spawn.f)(SpawnArg::Busy).await;
-                                        }
-                                        mpsc::error::TrySendError::Closed(cmd) => {
-                                            let entity_actor::Command::Spawn(spawn) = cmd else { panic!() };
-                                            error!("Entity actor inbox is closed, cannot send command to entity actor {:?}.", spawn.id);
-                                            // give the caller a chance to react to this bad news.
-                                            // at this point we are in trouble anyway, so awaiting is going to be the least of our problems.
-                                            (spawn.f)(SpawnArg::Dead).await;
-                                        }
-                                    }
+                                if let Some(task) = self.state.spawn(spawn.id, spawn.f).await {
+                                    self.tasks.spawn(task);
                                 }
                             }
                             Command::ShutdownAll(arg) => {
@@ -625,54 +578,16 @@ mod main_actor {
                                 break;
                             }
                         }
-                    },
-                    Some(cmd) = self.internal_recv.recv() => {
-                        match cmd {
-                            InternalCommand::Shutdown(Shutdown { id, receiver }) => {
-                                let Some(entity_handle) = self.live.remove(&id) else {
-                                    error!("Received shutdown command for unknown entity actor {id:?}");
-                                    break;
-                                };
-                                let EntityHandle::Live { send } = entity_handle else {
-                                    error!("Received shutdown command for entity actor {id:?} that is already shutting down");
-                                    break;
-                                };
-                                self.live.insert(id.clone(), EntityHandle::ShuttingDown {
-                                    send,
-                                    recv: receiver,
-                                });
-                            }
-                            InternalCommand::ShutdownComplete(ShutdownComplete { state, tasks }) => {
-                                let id = state.id.clone();
-                                let Some(entity_handle) = self.live.remove(&id) else {
-                                    error!("Received shutdown complete command for unknown entity actor {id:?}");
-                                    break;
-                                };
-                                let EntityHandle::ShuttingDown { send, recv } = entity_handle else {
-                                    error!("Received shutdown complete command for entity actor {id:?} that is not shutting down");
-                                    break;
-                                };
-                                // re-assemble the actor from the parts
-                                let mut actor = entity_actor::Actor {
-                                    main: self.internal_send.clone(),
-                                    recv,
-                                    state,
-                                    tasks,
-                                };
-                                if actor.recv.is_empty() {
-                                    // No commands during shutdown, we can recycle the actor.
-                                    self.recycle(send, actor);
-                                } else {
-                                    actor.state.state.reset();
-                                    self.tasks.spawn(actor.run());
-                                    self.live.insert(id.clone(), EntityHandle::Live { send });
-                                }
-                            }
+                        // Handle incoming command
+                    }
+                    SelectOutcome::Tick(future) => {
+                        if let Some(task) = future {
+                            self.tasks.spawn(task);
                         }
                     }
-                    Some(task) = self.tasks.join_next(), if !self.pool.is_empty() => {
+                    SelectOutcome::TaskDone(result) => {
                         // Handle completed task
-                        if let Err(e) = task {
+                        if let Err(e) = result {
                             eprintln!("Task failed: {e:?}");
                         }
                     }
@@ -681,27 +596,25 @@ mod main_actor {
         }
 
         async fn soft_shutdown(self) {
-            for handle in self.live.values() {
-                handle.send().send(EntityShutdown {}.into()).await.ok();
+            let Self {
+                mut tasks, state, ..
+            } = self;
+            state.shutdown().await;
+            while let Some(res) = tasks.join_next().await {
+                if let Err(e) = res {
+                    eprintln!("Task failed during shutdown: {e:?}");
+                }
             }
-            self.await_tasks().await;
         }
 
         async fn hard_shutdown(self) {
-            self.await_tasks().await;
-        }
-
-        /// Drop everything but the task set and await the completion of all tasks.
-        async fn await_tasks(self) {
             let Self {
-                mut tasks,
-                internal_recv,
-                ..
+                mut tasks, state, ..
             } = self;
             // this is needed so calls to internal_send in idle shutdown fail fast.
             // otherwise we would have to drain the channel, but we don't care about the messages at
             // this point.
-            drop(internal_recv);
+            drop(state);
             while let Some(res) = tasks.join_next().await {
                 if let Err(e) = res {
                     eprintln!("Task failed during shutdown: {e:?}");
